@@ -1,8 +1,10 @@
 from collections import defaultdict
 import os
+import time
 import torch
 import argparse
 import numpy as np
+from tqdm import tqdm
 from config import Config
 import warnings
 from som import train_som
@@ -10,11 +12,11 @@ from dataset.utils import compute_centroid
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--som_x', default=2, type=int, help="number of som neurons in the x-axis")
-    parser.add_argument('--som_y', default=2, type=int, help="number of som neurons in the y-axis")
+    parser.add_argument('--som_x', default=4, type=int, help="number of som neurons in the x-axis")
+    parser.add_argument('--som_y', default=4, type=int, help="number of som neurons in the y-axis")
     parser.add_argument('--iterations', default=10000, type=int, help="number of som training iterations")
     parser.add_argument('--lr', default=0.01, type=float, help="som learning rate")
-    parser.add_argument('--sigma', default=0.1, type=float, help="value of the radius of each som neuron") 
+    parser.add_argument('--sigma', default=0.3, type=float, help="value of the radius of each som neuron") 
     parser.add_argument('--layer', default=30, type=int, help="defines the model layer from which extract the embedding") 
     parser.add_argument('--model_name', default="llama2-7b", type=str, help="llm")
     parser.add_argument('--save_weights', default=False, action="store_true", help="if true, save neurons not directions")
@@ -55,7 +57,7 @@ def som_generate_save_dirs(cfg, som, X_in, Y, aux_name, save_weights, centroid=N
         print('Computing Neurons...')
         # this returns a numpy.ndarray som_x X som_y X repr_size
         weights = som.get_weights()
-        winners = np.array([som.winner(xi) for xi in X_in]) 
+        winners = np.array([som.winner(xi) for xi in tqdm(X_in, desc="Computing winners")])
         torch_w = torch.tensor(weights).view(weights.shape[0]*weights.shape[1], weights.shape[2])
         torch.save(torch_w, os.path.join(cfg.artifact_path(), f'generate_directions/{aux_name}_weights.pt') )
 
@@ -65,7 +67,7 @@ def som_generate_save_dirs(cfg, som, X_in, Y, aux_name, save_weights, centroid=N
         #    key = str(list(pair))  # Turn the numpy array into a list and stringify
         #    neuron_to_prompt_ids[key].append(idx)      
 
-        return torch.tensor(weights).squeeze(1), os.path.join(cfg.artifact_path(), f'generate_directions/{aux_name}_weights.pt')
+        return torch_w, os.path.join(cfg.artifact_path(), f'generate_directions/{aux_name}_weights.pt')
     
     else: #save directions 
 
@@ -73,7 +75,7 @@ def som_generate_save_dirs(cfg, som, X_in, Y, aux_name, save_weights, centroid=N
         print('Computing directions...')
         # this returns a numpy.ndarray som_x X som_y X repr_size
         weights = som.get_weights()
-        winners = np.array([som.winner(xi) for xi in X_in]) 
+        winners = np.array([som.winner(xi) for xi in tqdm(X_in, desc="Computing winners")])
 
         counts = defaultdict(lambda: [0, 0])  # [class_0_count, class_1_count]
         for winner, label in zip(winners, Y):
@@ -115,13 +117,20 @@ if __name__ == "__main__":
     cfg = Config(model_alias=model_alias, model_path=model_path)
     
     # this will simply load the already generated representation
-    HL_x, HF_x, Yhl, Yhf = load_data(args.model_name) 
+    HL_x, HF_x, Yhl, Yhf = load_data(args.model_name)
 
     X = np.concatenate([HF_x])
     Y = np.concatenate([Yhf])
-    X_in = X[:, args.layer, :] 
-    som = train_som(X_in, som_x=args.som_x, som_y=args.som_y, iterations=args.iterations, sigma=args.sigma, learning_rate=args.lr)
+    X_in = X[:, args.layer, :]
+
+    t0 = time.time()
+    som = train_som(X_in, som_x=args.som_x, som_y=args.som_y, iterations=args.iterations, sigma=args.sigma, learning_rate=args.lr, verbose=True)
+    print(f"  SOM training: {time.time() - t0:.1f}s")
+
     c0 = compute_centroid(HL_x, layer=args.layer)
     aux_name = f'centroid_to_som{args.som_x}_sigma{args.sigma}_layer{args.layer}'
+
+    t0 = time.time()
     directions, dir_path = som_generate_save_dirs(cfg, som, X_in, Y, aux_name=aux_name, save_weights=args.save_weights, centroid=c0)
+    print(f"  Direction generation: {time.time() - t0:.1f}s")
 

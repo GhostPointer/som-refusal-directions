@@ -1,3 +1,6 @@
+import time
+import warnings
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="fastchat.*")
 import torch
 from huggingface_hub import login
 from datasets import load_dataset
@@ -12,6 +15,8 @@ def get_args():
     parser.add_argument('--token_pos', default=-1, type=int, help="token position")
     parser.add_argument('--device', default="cuda", type=str, help="cuda device")
     parser.add_argument('--model_name', default="llama2-7b", type=str, help="llm")
+    parser.add_argument('--dataset', default="sorry-bench", type=str, help="dataset to use")
+    parser.add_argument('--layer', default=None, type=int, help="layer index (optional, default: extract all)")
     return parser.parse_args()
 
 def login_huggingface():
@@ -23,13 +28,14 @@ def load_and_prepare_datasets():
     ds_HF = load_dataset("sorry-bench/sorry-bench-202406")
     ds_HL = load_dataset("tatsu-lab/alpaca")
 
-    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] != 'uncommon_dialects')
-    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] != 'translate-ta')
-    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] != 'translate-ml')
-    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] != 'atbash')
-    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] != 'ascii')
-    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] != 'morse')
-    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] != 'caesar')
+    # Filter out encoded/non-English prompt styles that are not suitable for
+    # refusal evaluation (e.g., cipher-based or translated formats whose
+    # representations would not meaningfully encode refusal behavior).
+    excluded_styles = {
+        'uncommon_dialects', 'translate-ta', 'translate-ml',
+        'atbash', 'ascii', 'morse', 'caesar',
+    }
+    ds_HF = ds_HF.filter(lambda x: x['prompt_style'] not in excluded_styles)
     
 
     sorry_bench = ds_HF['train'].select_columns(["question_id","category","turns"])
@@ -95,10 +101,18 @@ def convert_samples(
     
 
     sorry_b, alpaca = load_and_prepare_datasets()
+
+    t0 = time.time()
     hidden_states = convert(alpaca, model, generate, token_pos, verbose=True)
     torch.save(hidden_states[:, :, :], output_dir + f'/HLx_train.pt')
+    t1 = time.time()
+    print(f"  HL (harmless) done in {t1 - t0:.1f}s ({len(alpaca)} samples, {(t1-t0)/len(alpaca):.2f}s/sample)")
+
     hidden_states = convert(sorry_b, model, generate, token_pos, verbose=True)
     torch.save(hidden_states[:, :, :], output_dir + f'/HFx_train.pt')
+    t2 = time.time()
+    print(f"  HF (harmful)  done in {t2 - t1:.1f}s ({len(sorry_b)} samples, {(t2-t1)/len(sorry_b):.2f}s/sample)")
+    print(f"  Total representation extraction: {t2 - t0:.1f}s")
  
     del model
     torch.cuda.empty_cache()

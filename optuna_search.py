@@ -13,20 +13,11 @@ import torch
 from optuna.distributions import IntDistribution
 
 from models.load_models import load_model
-from utils.ablation_utils import ablate_weights
+from utils.ablation_utils import ablate_weights, clear_ablation
+from utils import extract_direction_prefix
 from directions_ablation import generate_and_save_hookfree_completions
 from config import Config
-from eval_jailbreaks import evaluate_jailbreak
-
-
-# --------------------------------------------------------------------------- #
-#  helper                                                                     #
-# --------------------------------------------------------------------------- #
-def extract_direction_prefix(path: str) -> str:
-    m = re.search(r"((?:\w+_)?som[^\s/]+_layer\d{1,2})", os.path.basename(path))
-    if not m:
-        raise ValueError(f"Cannot parse prefix from {path}")
-    return m.group(1)
+from eval_jailbreaks import evaluate_jailbreak, load_judge, destroy_judge
 
 
 # --------------------------------------------------------------------------- #
@@ -64,7 +55,10 @@ class UniqueDirSampler(optuna.samplers.BaseSampler):
 
     def reseed_rng(self):
         self._base.reseed_rng()
-        self._rand.seed(self._base._rng.randint(0, 2**32 - 1))  # type: ignore[attr-defined]
+        try:
+            self._rand.seed(self._base._rng.randint(0, 2**32 - 1))  # type: ignore[attr-defined]
+        except AttributeError:
+            self._rand.seed(random.getrandbits(32))
 
     def sample_independent(
         self,
@@ -96,25 +90,22 @@ class UniqueDirSampler(optuna.samplers.BaseSampler):
 # --------------------------------------------------------------------------- #
 def evaluate_attack(
     dirs: List[int],
-    model_name: str,
-    directions_path: str,
+    llm,
+    cfg,
+    ablation_dirs,
     dataset_name: str,
-    device: str,
     aux_name: str,
     eval_path: str,
+    judge=None,
 ) -> float:
-    llm = load_model(model_name, device)
-    cfg = Config(model_alias=model_name, model_path=model_name)
-
     local_aux = f"{aux_name}_{dataset_name}_{'_'.join(map(str, dirs))}"
     print(f">> evaluating dirs {dirs}")
 
-    ablation_dirs = torch.load(directions_path)
-    aux_name = f"weights_raw_dirs_{extract_direction_prefix(directions_path)}"
+    # Clear any previous ablation, then apply new directions
+    clear_ablation(llm)
     print(">> ablating directions")
     for d in dirs:
         ablate_weights(llm, ablation_dirs[d])
-
 
     completions = generate_and_save_hookfree_completions(
         cfg=cfg,
@@ -124,14 +115,13 @@ def evaluate_attack(
         aux_name=local_aux,
         return_completions=True,
     )
-    del llm
-    torch.cuda.empty_cache()
 
     os.makedirs(eval_path, exist_ok=True)
     result = evaluate_jailbreak(
         completions=completions,
         methodologies=["harmbench"],
-        evaluation_path=f"{eval_path}/{local_aux}_results.json"
+        evaluation_path=f"{eval_path}/{local_aux}_results.json",
+        judge=judge,
     )
     return float(result["harmbench_success_rate"])
 
@@ -141,12 +131,28 @@ def evaluate_attack(
 # --------------------------------------------------------------------------- #
 def run_optimization(args):
 
-    # set path 
+    # set path
     evaluation_path = f"./runs/{args.model_name}/val_optim_evaluations"
 
     aux_name = f"weights_raw_dirs_{extract_direction_prefix(args.directions_path)}"
     print(">> using RAW directions")
 
+    # ---- load model, directions, and judge ONCE -------------------------- #
+    print(">> loading model (once)...")
+    llm = load_model(args.model_name, args.device)
+    cfg = Config(model_alias=args.model_name, model_path=args.model_name)
+
+    # For dense models, snapshot original weights before any ablation
+    from models.language_models import MiniMax_M25
+    if not isinstance(llm, MiniMax_M25):
+        llm.save_weights()
+
+    ablation_dirs = torch.load(args.directions_path)
+    print(f">> loaded {len(ablation_dirs)} direction vectors")
+
+    print(">> loading judge model (once)...")
+    judge = load_judge()
+    print(">> judge ready")
 
     bound, space = args.search_bound - 1, args.search_space
     assert bound + 1 >= space - 1, "Not enough distinct indices for the requested space"
@@ -156,13 +162,14 @@ def run_optimization(args):
         _objective,
         bound=bound,
         space=space,
-        model_name=args.model_name,
-        directions_path=args.directions_path,
+        llm=llm,
+        cfg=cfg,
+        ablation_dirs=ablation_dirs,
         dataset_name=args.dataset_name,
-        device='cuda:0',
         aux_name=aux_name,
         eval_path=evaluation_path,
-        fixed_dirs=args.fixed_dirs
+        fixed_dirs=args.fixed_dirs,
+        judge=judge,
     )
 
     # ---- study with custom sampler (TPE under the hood) ------------------- #
@@ -223,6 +230,13 @@ def run_optimization(args):
     print("Best params :", study.best_params)
     print("Best score :", study.best_value)
 
+    # ---- cleanup --------------------------------------------------------- #
+    destroy_judge(judge[0])
+    del llm
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
 
 # --------------------------------------------------------------------------- #
 #  Optuna objective (define-by-run)                                           #
@@ -232,24 +246,26 @@ def _objective(
     *,
     bound: int,
     space: int,
-    model_name: str,
-    directions_path: str,
+    llm,
+    cfg,
+    ablation_dirs,
     dataset_name: str,
-    device: str,
     aux_name: str,
     eval_path: str,
-    fixed_dirs: List[int]
+    fixed_dirs: List[int],
+    judge=None,
 ) -> float:
     dirs = fixed_dirs + [trial.suggest_int(f"dir_{i}", 0, bound) for i in range(space - len(fixed_dirs))]
 
     return evaluate_attack(
         dirs=dirs,
-        model_name=model_name,
-        directions_path=directions_path,
+        llm=llm,
+        cfg=cfg,
+        ablation_dirs=ablation_dirs,
         dataset_name=dataset_name,
-        device=device,
         aux_name=aux_name,
         eval_path=eval_path,
+        judge=judge,
     )
 
 
@@ -258,11 +274,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--directions_path", required=True)
     p.add_argument("--dataset_name", default="harmbench_val")
-    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--device", default="cuda")
     p.add_argument("--model_name", required=True)
     p.add_argument("--trials", type=int, default=16)
     p.add_argument("--search_space", type=int, default=5)
     p.add_argument("--search_bound", type=int, default=3)
     p.add_argument("--fixed_dirs", nargs='+', type=int, default=[], help="List of fixed direction indices") 
-    os.environ["CUDA_VISIBLE_DEVICES"] = p.parse_known_args()[0].device.split(":")[-1]
+    # Allow all GPUs for multi-GPU models (e.g., MiniMax-M2.5 across 3xH200)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = p.parse_known_args()[0].device.split(":")[-1]
     run_optimization(p.parse_args())

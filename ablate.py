@@ -1,21 +1,12 @@
 import os
+import time
 import torch
+import argparse
 from models.load_models import load_model
 from utils.ablation_utils import ablate_weights
+from utils import extract_direction_prefix
 from config import Config
 from directions_ablation import generate_and_save_hookfree_completions
-import argparse
- 
-import re
- 
-
-def extract_direction_prefix(filepath: str) -> str:
-    basename = os.path.basename(filepath)
-    match = re.search(r"((?:\w+_)?som[^\s/]+_layer\d{1,2})", basename)
-    if match:
-        return match.group(1)
-    else:
-        raise ValueError(f"Could not extract prefix from filename: {filepath}")
  
  
 if __name__ == "__main__":
@@ -27,31 +18,38 @@ if __name__ == "__main__":
     parser.add_argument('--device', default="cuda:0", type=str)
     args = parser.parse_args()
  
+    t_pipeline = time.time()
+
     # model and config
+    t0 = time.time()
     device = torch.device(args.device)
     model = load_model(args.model_name, device=device)
+    print(f"  Model loaded in {time.time() - t0:.1f}s")
     model_path = args.model_name
     model_alias = os.path.basename(model_path)
     cfg = Config(model_alias=model_alias, model_path=model_path)
- 
+
     directions = torch.load(args.directions_path)
     multi_dirs = directions[args.dir_ids] if args.dir_ids else directions
     aux_name = 'raw_dirs'
     print('Using raw directions')
-    
+
     # Load direction
     len_dir = len(multi_dirs.shape)
     print(f"→ Loaded {len_dir}D direction vectors from {args.directions_path} with shape {multi_dirs.shape}")
 
-
+    t0 = time.time()
     for idx, sing_dir in enumerate(multi_dirs):
-        aux_name += '_'+str(args.dir_ids[idx])
+        dir_label = str(args.dir_ids[idx]) if args.dir_ids else str(idx)
+        aux_name += '_' + dir_label
         ablate_weights(model, sing_dir)
-    
+    print(f"  Ablation done in {time.time() - t0:.1f}s")
+
     # completions name
     aux_name = aux_name+'_'+extract_direction_prefix(args.directions_path)
- 
+
     # Run generation
+    t0 = time.time()
     generate_and_save_hookfree_completions(
         cfg=cfg,
         folder='completions',
@@ -59,3 +57,5 @@ if __name__ == "__main__":
         dataset_name=args.dataset_name,
         aux_name=aux_name
     )
+    print(f"  Generation done in {time.time() - t0:.1f}s")
+    print(f"  Total pipeline: {time.time() - t_pipeline:.1f}s")

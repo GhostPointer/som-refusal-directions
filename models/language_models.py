@@ -37,6 +37,28 @@ class LanguageModel(ABC):
     def _get_ablation_mod_fn(self, direction):
         return functools.partial(ablate_weights, direction=direction)
 
+    def save_weights(self):
+        """Snapshot weight matrices modified by ablation, for later restoration.
+        Override in subclasses that use hooks instead of in-place modification."""
+        self._saved_weights = {
+            'embed': self.model.model.embed_tokens.weight.data.clone(),
+        }
+        for i, block in enumerate(self.model.model.layers):
+            self._saved_weights[f'layer_{i}_attn'] = block.self_attn.o_proj.weight.data.clone()
+            self._saved_weights[f'layer_{i}_mlp'] = block.mlp.down_proj.weight.data.clone()
+        print("✓ Original weights saved.")
+
+    def clear_ablation(self):
+        """Restore weights to pre-ablation state.
+        Override in subclasses that use hooks instead of in-place modification."""
+        if not hasattr(self, '_saved_weights') or self._saved_weights is None:
+            raise RuntimeError("No saved weights found. Call save_weights() before the first ablation.")
+        self.model.model.embed_tokens.weight.data = self._saved_weights['embed'].clone()
+        for i, block in enumerate(self.model.model.layers):
+            block.self_attn.o_proj.weight.data = self._saved_weights[f'layer_{i}_attn'].clone()
+            block.mlp.down_proj.weight.data = self._saved_weights[f'layer_{i}_mlp'].clone()
+        print("✓ Weights restored to original.")
+
     def load_model(self):
         if self.model is None or self.tokenizer is None:
             token = os.environ.get('HF_TOKEN')
@@ -65,6 +87,7 @@ class LanguageModel(ABC):
                     token=token,
                     quantization_config=quantization_config,
                     device_map=self.device,
+                    trust_remote_code=True,
                 )
                 self.model.requires_grad_(False) 
             else:
@@ -201,7 +224,7 @@ class LanguageModel(ABC):
         formatted_prompt = self._get_prompt(prompt=prompt)
         inputs = self.tokenizer(formatted_prompt, return_tensors="pt" ).to(self.device)
         with torch.no_grad():
-            outputs = self.model(input_ids=inputs.input_ids, do_sample=False, output_hidden_states=True, temperature=None, top_k=None, top_p=None)
+            outputs = self.model(input_ids=inputs.input_ids, output_hidden_states=True)
 
         hidden_states = torch.cat(outputs.hidden_states[1:])[:, token_pos, :].float()
         hidden_states = hidden_states.reshape(1, self.num_layer, self.hidden_dimension)
@@ -586,7 +609,7 @@ class Qwen2_7b(LanguageModel):
         print("✓ Weights ablated.")
    
 class Gemma2_9b(LanguageModel):
-    
+
     """A class to manage the 'google/gemma-2-9b-it' model."""
 
     def __init__(self, model_name: str = "google/gemma-2-9b-it", device='cuda', system_prompt=None, quantization_config=None):
@@ -597,7 +620,7 @@ class Gemma2_9b(LanguageModel):
         self.load_model()
 
     def _get_prompt(self, prompt=''):
-    
+
         formatted_prompt = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
 
         return formatted_prompt
@@ -607,6 +630,176 @@ class Gemma2_9b(LanguageModel):
 
         for block in self.model.model.layers:
             block.self_attn.o_proj.weight.data = get_ablated_matrix(block.self_attn.o_proj.weight.data.T, direction).T
-            block.mlp.down_proj.weight.data = get_ablated_matrix(block.mlp.down_proj.weight.data.T, direction).T 
+            block.mlp.down_proj.weight.data = get_ablated_matrix(block.mlp.down_proj.weight.data.T, direction).T
 
         print("✓ Weights ablated.")
+
+
+class MiniMax_M25(LanguageModel):
+    """A class to manage the local 'MiniMax-M2.5' MoE model.
+
+    Mixture-of-Experts architecture with 256 local experts and top-8 routing.
+    Ablation iterates over every expert's down projection (w2) in each layer,
+    rather than a single mlp.down_proj as in dense models.
+    """
+
+    def __init__(self, model_name: str = "/root/MiniMax-M2.5", device='auto', system_prompt=None, quantization_config=None):
+        super().__init__(model_name, system_prompt, device, quantization_config)
+        self.template_name = 'minimax'
+        self.hidden_dimension = 3072
+        self.num_layer = 62
+        # NOTE: You may need to update this to the exact token IDs used for refusal by MiniMax (e.g. 'I', 'As', 'Sorry')
+        self.refusal_token_id = [40, 2121]
+        self.load_model()
+
+    def load_model(self):
+        """Load MiniMax-M2.5 with native FP8 weights.
+
+        Overrides the base class to avoid specifying torch_dtype, which can
+        interfere with the model's built-in FP8 quantization_config.
+        Uses device_map='auto' for multi-GPU distribution (e.g. 8×H200).
+        """
+        if self.model is None or self.tokenizer is None:
+            token = os.environ.get('HF_TOKEN')
+            print(f"Downloading and loading model {self.model_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, token=token, trust_remote_code=True
+            )
+            # MiniMax ships with native FP8 weights — do NOT specify torch_dtype
+            # as it interferes with the model's quantization_config.
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                token=token,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            self.model.requires_grad_(False)
+            
+            # FIX: 'auto' is an invalid torch device string for tensor.to().
+            # Update self.device to match the model's root device (usually cuda:0)
+            self.device = self.model.device
+
+            if self.tokenizer.pad_token is None:
+                if self.tokenizer.eos_token is not None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                    self.tokenizer.padding_side = "left"
+
+            # Display device map info
+            if hasattr(self.model, 'hf_device_map'):
+                devices_used = sorted(set(str(d) for d in self.model.hf_device_map.values()))
+                print(f"Model distributed across devices: {', '.join(devices_used)}")
+                print(f"  Layers mapped: {len(self.model.hf_device_map)} modules")
+            else:
+                print(f"Model on device: {self.device}")
+            print("Model loaded successfully.")
+        else:
+            print("Model already loaded.")
+
+    def _get_prompt(self, prompt=''):
+        """Formats the prompt using the model's chat template."""
+        if self.system_prompt is not None:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        formatted_prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        return formatted_prompt
+
+    def _get_mlp_modules(self):
+        """Return the MoE blocks (not plain MLP) for each layer."""
+        return torch.nn.ModuleList(
+            [block.block_sparse_moe for block in self.model_block_modules]
+        )
+
+    def generate_hookfree_completions(self, dataset, batch_size=1, max_new_tokens=64):
+        """Override base class to use batch_size=1.
+
+        MiniMax MoE with ablation hooks produces null-byte garbage when prompts
+        are left-padded in a batch — the hooks modify padded positions, corrupting
+        outputs for shorter prompts. Processing one prompt at a time avoids this.
+        """
+        return super().generate_hookfree_completions(dataset, batch_size=batch_size, max_new_tokens=max_new_tokens)
+
+    def ablate_weights(self, direction: torch.Tensor, layer_window: int = 10):
+        """
+        Instead of modifying 75B block-quantized FP8 weights matrix-by-matrix and destroying
+        their per-block quantization scales, we register a PyTorch forward hook.
+
+        Mathematically: W' = W - (W*r)r^T is equivalent to y' = y - (y*r)r on the outputs.
+
+        NOTE for MiniMax MoE:
+        - o_proj hooks are SKIPPED: projecting the refusal direction out of raw attention
+          outputs across all layers destroys generation quality.
+        - Expert w2 hooks are restricted to a WINDOW of layers around the layer where the
+          direction was computed. Ablating all 62 layers produces null-byte garbage for
+          some prompts. A ±layer_window range keeps the model coherent.
+
+        Args:
+            direction: The refusal direction to ablate.
+            layer_window: Number of layers on each side of the midpoint to ablate.
+                         With 62 layers and default window=10, ablates layers 21-41.
+                         Set to self.num_layer to ablate all layers.
+        """
+        # Normalize and prepare the direction vector
+        direction = direction / torch.norm(direction)
+        direction = direction.to(self.device)
+
+        # The hook function that projects r out of the output activations
+        def ablation_hook(module, args, output):
+            y = output
+            for r in module.ablation_dirs:
+                r_cast = r.to(dtype=y.dtype, device=y.device)
+                # y' = y - (y @ r) * r
+                proj = torch.matmul(y, r_cast).unsqueeze(-1)
+                y = y - proj * r_cast
+            return y
+
+        # Helper to attach exactly one hook (while supporting multiple sequential ablations)
+        def attach_hook(module):
+            if not hasattr(module, 'ablation_dirs'):
+                module.ablation_dirs = []
+                module.register_forward_hook(ablation_hook)
+            module.ablation_dirs.append(direction)
+
+        # Compute layer range: center on midpoint (layer 31 for 62-layer model)
+        mid = self.num_layer // 2
+        lo = max(0, mid - layer_window)
+        hi = min(self.num_layer, mid + layer_window + 1)
+
+        print("Ablating via activation hooks (preserves FP8 scales)...")
+        print("  Layer range: {}-{} (of {} total)".format(lo, hi - 1, self.num_layer))
+        # 1. Embed Tokens
+        attach_hook(self.model.model.embed_tokens)
+
+        # 2. MoE expert down-projections (w2) in the target layer window only
+        layers = self.model.model.layers
+        n_experts_hooked = 0
+        for layer_idx, block in enumerate(layers):
+            if layer_idx < lo or layer_idx >= hi:
+                continue
+            if hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'experts'):
+                for expert in block.block_sparse_moe.experts:
+                    attach_hook(expert.w2)
+                    n_experts_hooked += 1
+
+        print("✓ Hooks applied: embed + {} expert w2 modules (layers {}-{}).".format(
+            n_experts_hooked, lo, hi - 1))
+
+    def clear_ablation(self):
+        """Clear all ablation directions from hooks, resetting model to original state."""
+        def clear_dirs(module):
+            if hasattr(module, 'ablation_dirs'):
+                module.ablation_dirs.clear()
+
+        clear_dirs(self.model.model.embed_tokens)
+        for block in self.model.model.layers:
+            clear_dirs(block.self_attn.o_proj)
+            if hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'experts'):
+                for expert in block.block_sparse_moe.experts:
+                    clear_dirs(expert.w2)
+        print("✓ Ablation hooks cleared.")

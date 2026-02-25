@@ -1,4 +1,4 @@
-from models.language_models import Llama2_7b, Llama3_8b, Llama2_13b, Qwen_7b, Qwen_14b, Qwen2_3b, Qwen2_7b, Mistral7B_RR, Zephyr_R2D2, Gemma2_9b
+from models.language_models import Llama2_7b, Llama3_8b, Llama2_13b, Qwen_7b, Qwen_14b, Qwen2_3b, Qwen2_7b, Mistral7B_RR, Zephyr_R2D2, Gemma2_9b, MiniMax_M25
 
 
 def load_model(model_name, device, system_prompt='default'):
@@ -14,7 +14,8 @@ def load_model(model_name, device, system_prompt='default'):
             'qwen2-7b': Qwen2_7b,
             'mistral-7b-rr': Mistral7B_RR,
             'r2d2': Zephyr_R2D2,
-            'gemma2-9b': Gemma2_9b
+            'gemma2-9b': Gemma2_9b,
+            'minimax-m2.5': MiniMax_M25
         }
         print(f"Initializing model: {model_name} on device: {device}")
         if system_prompt != 'default':

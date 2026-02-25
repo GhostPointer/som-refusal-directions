@@ -1,38 +1,33 @@
-from collections import defaultdict
 import os
 import json
-import torch
 import random
+import time
 import argparse
-import numpy as np 
-from minisom import MiniSom
-import plotly.graph_objects as go
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from dataset.utils import compute_centroid
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.patches import RegularPolygon
 from collections import defaultdict
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from matplotlib import cm, colorbar
+
 import numpy as np
+import torch
+import seaborn as sns
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-from matplotlib.patches import RegularPolygon
 from matplotlib import cm
 from matplotlib.colorbar import ColorbarBase
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from collections import defaultdict
-import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import RegularPolygon
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from minisom import MiniSom
+from sklearn.decomposition import PCA
+import plotly.graph_objects as go
+
+from dataset.utils import compute_centroid
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--som_x', default=3, type=int, help="number of som neurons in the x-axis")
-    parser.add_argument('--som_y', default=3, type=int, help="number of som neurons in the y-axis")
+    parser.add_argument('--som_x', default=4, type=int, help="number of som neurons in the x-axis")
+    parser.add_argument('--som_y', default=4, type=int, help="number of som neurons in the y-axis")
     parser.add_argument('--iterations', default=10000, type=int, help="number of som training iterations")
     parser.add_argument('--lr', default=0.01, type=float, help="som learning rate")
-    parser.add_argument('--sigma', default=0.33, type=float, help="value of the radius of each som neuron")
+    parser.add_argument('--sigma', default=0.3, type=float, help="value of the radius of each som neuron")
     parser.add_argument('--pca', default=False, action="store_true", help="runs pca on embedding when true")
     parser.add_argument('--components', default=10, type=int, help="number of PCA components")
     parser.add_argument('--ranked', default=False, action="store_true", help="plots the rank of the neurons on top of the som")
@@ -94,14 +89,8 @@ def set_filename(args):
     return base + ".pdf"
 
 def plot_ranked_som_neurons_by_harmful_activity_hex(som, X_in, Y, filename="ranked_hexsom.pdf"):
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import RegularPolygon
-    from matplotlib import cm
     from matplotlib.colors import Normalize
-    from mpl_toolkits.axes_grid1 import make_axes_locatable
-    from collections import defaultdict
-    # just once, at top of your function
+
     palette = sns.color_palette("Paired")
     paired_green = palette[3]   # this is “#33a02c”
 
@@ -230,10 +219,10 @@ def load_data(reduce=None, model_name="llama3-8b"):
     
     return HL_x, HF_x, Yhl, Yhf
 
-def train_som(data, som_x=500, som_y=500, iterations=10000, sigma=0.01, learning_rate=0.01):
+def train_som(data, som_x=500, som_y=500, iterations=10000, sigma=0.01, learning_rate=0.01, verbose=False):
     """
     Create and train a Self-Organizing Map (SOM) using MiniSom.
-    
+
     Parameters:
       data: np.ndarray of shape [n_samples, input_len]
       som_x: int, number of neurons in the x-direction of the grid
@@ -241,15 +230,16 @@ def train_som(data, som_x=500, som_y=500, iterations=10000, sigma=0.01, learning
       iterations: int, number of training iterations
       sigma: float, neighborhood radius
       learning_rate: float, learning rate
-      
+      verbose: bool, if True print per-iteration progress
+
     Returns:
       som: trained MiniSom instance
     """
     input_len = data.shape[1]
     som = MiniSom(som_x, som_y, input_len, sigma=sigma, learning_rate=learning_rate, random_seed=0, activation_distance='euclidean', topology='hexagonal')
     som.random_weights_init(data)
-    print("Training SOM...")
-    som.train_random(data, iterations)
+    print(f"Training SOM ({som_x}x{som_y}, {iterations} iters, sigma={sigma}, lr={learning_rate})...")
+    som.train_random(data, iterations, verbose=verbose)
     print("SOM training complete.")
     return som
 
@@ -298,7 +288,7 @@ def evaluate_layer_som(
     )
 
     # count hits per neuron
-    winners = np.array([som.winner(xi) for xi in X_in])
+    winners = np.array([som.winner(xi) for xi in tqdm(X_in, desc="  Computing winners", leave=False)])
     counts = defaultdict(lambda: [0, 0])
     for (wx, wy), label in zip(winners, Y):
         counts[(wx, wy)][int(label)] += 1
@@ -347,6 +337,7 @@ def plot_som_ranked_neurons(
     som,
     data: np.ndarray,
     labels: np.ndarray,
+    top_k: int = 4,
     som_x: int = 30,
     som_y: int = 30,
     filename: str = 'ranked_neurons.png'
@@ -355,25 +346,17 @@ def plot_som_ranked_neurons(
     Plot top-k most winning neurons for harmful (label=1) and harmless (label=0) samples.
     Labels are shown as: 0HF, 1HF, ..., 0HL, 1HL, ...
     """
-    winners = np.array([som.winner(xi) for xi in data]) 
+    winners = np.array([som.winner(xi) for xi in data])
     counts = defaultdict(lambda: [0, 0])  # [class_0_count, class_1_count]
 
     for winner, label in zip(winners, labels):
         winner_tuple = tuple(winner)  # convert array([i, j]) → (i, j)
         label_int = int(label)        # ensure 0 or 1 as Python int
-        counts[winner_tuple][label_int] += 1 
-    
-    # sort neurons by number of wins for each class
-    sorted_class_0 = sorted(counts.items(), key=lambda item: item[1][0], reverse=True)
-    sorted_class_1 = sorted(counts.items(), key=lambda item: item[1][1], reverse=True)
+        counts[winner_tuple][label_int] += 1
 
-    # take top-k neurons for each class
-    top_k_class_0 = [item[0] for item in sorted_class_0[:top_k]]
-    top_k_class_1 = [item[0] for item in sorted_class_1[:top_k]]
-    print(top_k_class_0, top_k_class_1)
     # Sort neurons separately by HL and HF frequency
-    sorted_HL = sorted(win_counts.items(), key=lambda x: x[1][0], reverse=True)[:top_k]
-    sorted_HF = sorted(win_counts.items(), key=lambda x: x[1][1], reverse=True)[:top_k]
+    sorted_HL = sorted(counts.items(), key=lambda x: x[1][0], reverse=True)[:top_k]
+    sorted_HF = sorted(counts.items(), key=lambda x: x[1][1], reverse=True)[:top_k]
 
     # Extract the neuron positions
     hl_winners = [pos for (pos, _) in sorted_HL]
@@ -403,14 +386,14 @@ def plot_som_ranked_neurons(
 
 def plot_umatrices_over_sigma(X, pca, pca_components=10, som_x=30, som_y=30, iterations=3000, sigmas_list=[1,2,3], filename='plot.png'):
     """
-    Plot U-Matrices of SOMs trained on PCA-reduced data with varying numbers of components.
+    Plot U-Matrices of SOMs trained on data with varying sigma values.
     """
     n_cols = 5
     n_rows = int(np.ceil(len(sigmas_list) / n_cols))
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 4))
 
-    for idx, n_comp in enumerate(sigmas_list):
+    for idx, sigma_val in enumerate(sigmas_list):
         row, col = divmod(idx, n_cols)
         ax = axes[row, col] if n_rows > 1 else axes[col]
 
@@ -419,11 +402,11 @@ def plot_umatrices_over_sigma(X, pca, pca_components=10, som_x=30, som_y=30, ite
             pca = PCA(n_components=pca_components)
             X_in = pca.fit_transform(X)
 
-        som = train_som(X_in, som_x=som_x, som_y=som_y, iterations=iterations, learning_rate=0.01, sigma=n_comp)
+        som = train_som(X_in, som_x=som_x, som_y=som_y, iterations=iterations, learning_rate=0.01, sigma=sigma_val)
 
         u_matrix = som.distance_map().T
         im = ax.imshow(u_matrix, cmap='bone_r', origin='lower')
-        ax.set_title(f"Sigma: {n_comp}")
+        ax.set_title(f"Sigma: {sigma_val}")
         ax.set_xticks([])
         ax.set_yticks([])
 
@@ -584,7 +567,7 @@ def main():
 
     if args.ranked_plot:
         HF_layer = HF_x[:, args.layer, :]
-        som = train_som(HF_layer, som_x=args.som_x, som_y=args.som_y, iterations=args.iterations, learning_rate=args.lr, sigma=args.sigma)
+        som = train_som(HF_layer, som_x=args.som_x, som_y=args.som_y, iterations=args.iterations, learning_rate=args.lr, sigma=args.sigma, verbose=True)
         plot_ranked_som_neurons_by_harmful_activity_hex(som=som,
                                 X_in=HF_layer,       
                                 Y=Yhf,
@@ -600,7 +583,10 @@ def main():
         pca_obj = PCA(n_components=args.components) if args.pca else None
 
         best_layer, best_score, best_counts = -1, float('-inf'), []
-        for layer in range(X.shape[1]):
+        num_layers = X.shape[1]
+        t_start = time.time()
+        for layer in tqdm(range(num_layers), desc="Evaluating layers", unit="layer"):
+            t_layer = time.time()
             score, counts = evaluate_layer_som(
                 X[:, layer, :], Y,
                 som_x=args.som_x,
@@ -611,16 +597,22 @@ def main():
                 pca=pca_obj,
                 top_k=args.top_k
             )
-            print(
+            elapsed_layer = time.time() - t_layer
+            elapsed_total = time.time() - t_start
+            remaining = elapsed_layer * (num_layers - layer - 1)
+            tqdm.write(
                 f"Layer {layer:2d} → avg_diff {score:.4f}, "
-                f"top_2*{args.top_k} counts: {counts}"
+                f"top_2*{args.top_k} counts: {counts}  "
+                f"[{elapsed_layer:.1f}s, ~{remaining/60:.0f}min remaining]"
             )
             if score > best_score:
                 best_score, best_layer, best_counts = score, layer, counts
 
+        total_time = time.time() - t_start
         print(
             f"\n>> Best layer: {best_layer} "
             f"(avg_diff {best_score:.4f}, counts {best_counts})"
+            f"\n   Total find_layer time: {total_time/60:.1f}min ({total_time/num_layers:.1f}s/layer)"
         )
         return
 
@@ -639,7 +631,7 @@ def main():
             pca = None
             
         # train som 
-        som = train_som(X_in, som_x=args.som_x, som_y=args.som_y, iterations=args.iterations, learning_rate=args.lr, sigma=args.sigma)
+        som = train_som(X_in, som_x=args.som_x, som_y=args.som_y, iterations=args.iterations, learning_rate=args.lr, sigma=args.sigma, verbose=True)
 
         # overlay data 
         if args.ol_centr or args.ol_data: 
@@ -647,11 +639,12 @@ def main():
             c0 = compute_centroid(HL_x, layer)
             c1 = compute_centroid(HF_x, layer)
             # plot overlayed data
-            plot_overlay_data_on_som(som, pca, 
-                                X_in, Y, 
-                                c0, c1, midp, 
-                                4096, 
-                                layer, ol_centr=args.ol_centr, 
+            hidden_dim = HF_x.shape[-1]
+            plot_overlay_data_on_som(som, pca,
+                                X_in, Y,
+                                c0, c1, midp,
+                                hidden_dim,
+                                layer, ol_centr=args.ol_centr,
                                 ol_data=args.ol_data, filename=filename)
 
         elif not args.ranked: 
