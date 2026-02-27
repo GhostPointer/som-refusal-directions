@@ -696,7 +696,7 @@ class MiniMax_M25(LanguageModel):
             print("Model already loaded.")
 
     def _get_prompt(self, prompt=''):
-        """Formats the prompt using the model's chat template."""
+        """Formats the prompt using the model's chat template and appends </think> properly to skip Chain-of-Thought generation."""
         if self.system_prompt is not None:
             messages = [
                 {"role": "system", "content": self.system_prompt},
@@ -708,6 +708,10 @@ class MiniMax_M25(LanguageModel):
         formatted_prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        
+        # Bypass reasoning step to save compute/tokens during testing
+        formatted_prompt += "</think>\n\n"
+        
         return formatted_prompt
 
     def _get_mlp_modules(self):
