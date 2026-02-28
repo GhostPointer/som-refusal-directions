@@ -97,6 +97,7 @@ def evaluate_attack(
     aux_name: str,
     eval_path: str,
     judge=None,
+    target_layer: int = 31,
 ) -> float:
     local_aux = f"{aux_name}_{dataset_name}_{'_'.join(map(str, dirs))}"
     print(f">> evaluating dirs {dirs}")
@@ -105,7 +106,7 @@ def evaluate_attack(
     clear_ablation(llm)
     print(">> ablating directions")
     for d in dirs:
-        ablate_weights(llm, ablation_dirs[d])
+        ablate_weights(llm, ablation_dirs[d], source_layer=target_layer)
 
     completions = generate_and_save_hookfree_completions(
         cfg=cfg,
@@ -169,6 +170,7 @@ def run_optimization(args):
         aux_name=aux_name,
         eval_path=evaluation_path,
         fixed_dirs=args.fixed_dirs,
+        target_layer=args.layer,
         judge=judge,
     )
 
@@ -253,6 +255,7 @@ def _objective(
     aux_name: str,
     eval_path: str,
     fixed_dirs: List[int],
+    target_layer: int,
     judge=None,
 ) -> float:
     dirs = fixed_dirs + [trial.suggest_int(f"dir_{i}", 0, bound) for i in range(space - len(fixed_dirs))]
@@ -266,6 +269,7 @@ def _objective(
         aux_name=aux_name,
         eval_path=eval_path,
         judge=judge,
+        target_layer=target_layer,
     )
 
 
@@ -279,6 +283,7 @@ if __name__ == "__main__":
     p.add_argument("--trials", type=int, default=16)
     p.add_argument("--search_space", type=int, default=5)
     p.add_argument("--search_bound", type=int, default=3)
+    p.add_argument("--layer", type=int, default=31, help="Layer where directions were extracted")
     p.add_argument("--fixed_dirs", nargs='+', type=int, default=[], help="List of fixed direction indices") 
     # Allow all GPUs for multi-GPU models (e.g., MiniMax-M2.5 across 3xH200)
     # os.environ["CUDA_VISIBLE_DEVICES"] = p.parse_known_args()[0].device.split(":")[-1]

@@ -156,11 +156,21 @@ class LanguageModel(ABC):
             add_special_tokens=True
                 )
             
-            generation_toks = self.model.generate(
-                input_ids=tokenized_instructions.input_ids.to(self.model.device),
-                attention_mask=tokenized_instructions.attention_mask.to(self.model.device),
-                generation_config=generation_config,
-            )
+            # Save the attention mask so hooks can read it to ignore padding.
+            # Store on CPU; the per-device cache avoids repeated cross-GPU copies.
+            self._current_attention_mask = tokenized_instructions.attention_mask  # keep on CPU
+            self._padding_mask_cache = {}  # {device: is_padding tensor}
+
+            try:
+                generation_toks = self.model.generate(
+                    input_ids=tokenized_instructions.input_ids.to(self.model.device),
+                    attention_mask=self._current_attention_mask.to(self.model.device),
+                    generation_config=generation_config,
+                )
+            finally:
+                # Clear the mask even if generate() throws (OOM, NCCL timeout, etc.)
+                self._current_attention_mask = None
+                self._padding_mask_cache = {}
 
             generation_toks = generation_toks[:, tokenized_instructions.input_ids.shape[-1]:]
 
@@ -639,8 +649,8 @@ class MiniMax_M25(LanguageModel):
     """A class to manage the local 'MiniMax-M2.5' MoE model.
 
     Mixture-of-Experts architecture with 256 local experts and top-8 routing.
-    Ablation iterates over every expert's down projection (w2) in each layer,
-    rather than a single mlp.down_proj as in dense models.
+    Ablation attaches hooks directly to the block_sparse_moe modules, which
+    preserves spatial dimensions (batch, seq_len, dim) for padding protection.
     """
 
     def __init__(self, model_name: str = "/root/MiniMax-M2.5", device='auto', system_prompt=None, quantization_config=None):
@@ -720,16 +730,14 @@ class MiniMax_M25(LanguageModel):
             [block.block_sparse_moe for block in self.model_block_modules]
         )
 
-    def generate_hookfree_completions(self, dataset, batch_size=1, max_new_tokens=64):
-        """Override base class to use batch_size=1.
-
-        MiniMax MoE with ablation hooks produces null-byte garbage when prompts
-        are left-padded in a batch — the hooks modify padded positions, corrupting
-        outputs for shorter prompts. Processing one prompt at a time avoids this.
+    def generate_hookfree_completions(self, dataset, batch_size=16, max_new_tokens=64):
+        """Override base class but retain block processing capabilities.
+        
+        Using batch_size=16 now that attention masks protect padded tokens.
         """
         return super().generate_hookfree_completions(dataset, batch_size=batch_size, max_new_tokens=max_new_tokens)
 
-    def ablate_weights(self, direction: torch.Tensor, layer_window: int = 10):
+    def ablate_weights(self, direction: torch.Tensor, layer_window: int = 10, source_layer: int = 31):
         """
         Instead of modifying 75B block-quantized FP8 weights matrix-by-matrix and destroying
         their per-block quantization scales, we register a PyTorch forward hook.
@@ -739,71 +747,98 @@ class MiniMax_M25(LanguageModel):
         NOTE for MiniMax MoE:
         - o_proj hooks are SKIPPED: projecting the refusal direction out of raw attention
           outputs across all layers destroys generation quality.
-        - Expert w2 hooks are restricted to a WINDOW of layers around the layer where the
-          direction was computed. Ablating all 62 layers produces null-byte garbage for
-          some prompts. A ±layer_window range keeps the model coherent.
+        - MoE block hooks are restricted to a WINDOW of layers around the layer where the
+          direction was computed.
 
         Args:
             direction: The refusal direction to ablate.
             layer_window: Number of layers on each side of the midpoint to ablate.
-                         With 62 layers and default window=10, ablates layers 21-41.
-                         Set to self.num_layer to ablate all layers.
+            source_layer: The layer the direction was computed from (to center the window).
         """
         # Normalize and prepare the direction vector
         direction = direction / torch.norm(direction)
         direction = direction.to(self.device)
 
-        # The hook function that projects r out of the output activations
+        # The hook function that projects r out of the output activations.
+        # Handles both plain tensors (embed_tokens) and tuple outputs (block_sparse_moe
+        # returns (hidden_states, router_logits)).
         def ablation_hook(module, args, output):
-            y = output
+            is_tuple = isinstance(output, tuple)
+            y = output[0] if is_tuple else output
+
+            # Compute the padding mask ONCE before the direction loop.
+            # Use the per-device cache so each GPU only copies the mask once
+            # per generate() call, not once per hook invocation.
+            mask = getattr(self, '_current_attention_mask', None)
+            prefill = mask is not None and y.dim() == 3 and y.size(1) == mask.size(1)
+            if prefill:
+                cache = getattr(self, '_padding_mask_cache', {})
+                dev = y.device
+                if dev not in cache:
+                    # Inverted: True = padding position, False = content
+                    cache[dev] = (~mask.to(dev).bool()).unsqueeze(-1)  # [batch, seq_len, 1]
+                is_padding = cache[dev]
+
             for r in module.ablation_dirs:
-                r_cast = r.to(dtype=y.dtype, device=y.device)
-                # y' = y - (y @ r) * r
+                # r is already on the module's device (placed there by attach_hook),
+                # so this is a dtype-only cast — no cross-GPU copy.
+                r_cast = r.to(dtype=y.dtype)
                 proj = torch.matmul(y, r_cast).unsqueeze(-1)
-                y = y - proj * r_cast
-            return y
+                delta = proj * r_cast
+
+                # Zero out the delta for padding tokens during prefill
+                if prefill:
+                    delta = delta.masked_fill(is_padding, 0.0)
+
+                y = y - delta
+            return (y,) + output[1:] if is_tuple else y
 
         # Helper to attach exactly one hook (while supporting multiple sequential ablations)
         def attach_hook(module):
             if not hasattr(module, 'ablation_dirs'):
                 module.ablation_dirs = []
-                module.register_forward_hook(ablation_hook)
-            module.ablation_dirs.append(direction)
+                module._ablation_hook_handle = module.register_forward_hook(ablation_hook)
+            # Place direction on the module's device so the hook avoids
+            # cross-GPU copies on every forward pass.
+            try:
+                mod_device = next(module.parameters()).device
+            except StopIteration:
+                mod_device = self.device
+            module.ablation_dirs.append(direction.to(mod_device))
 
-        # Compute layer range: center on midpoint (layer 31 for 62-layer model)
-        mid = self.num_layer // 2
-        lo = max(0, mid - layer_window)
-        hi = min(self.num_layer, mid + layer_window + 1)
+        # Compute layer range: center on the source layer where the direction was extracted
+        lo = max(0, source_layer - layer_window)
+        hi = min(self.num_layer, source_layer + layer_window + 1)
 
         print("Ablating via activation hooks (preserves FP8 scales)...")
-        print("  Layer range: {}-{} (of {} total)".format(lo, hi - 1, self.num_layer))
+        print("  Layer range: {}-{} (of {} total) centered on layer {}".format(lo, hi - 1, self.num_layer, source_layer))
         # 1. Embed Tokens
         attach_hook(self.model.model.embed_tokens)
 
-        # 2. MoE expert down-projections (w2) in the target layer window only
+        # 2. MoE blocks in the target layer window only
         layers = self.model.model.layers
-        n_experts_hooked = 0
+        n_blocks_hooked = 0
         for layer_idx, block in enumerate(layers):
             if layer_idx < lo or layer_idx >= hi:
                 continue
-            if hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'experts'):
-                for expert in block.block_sparse_moe.experts:
-                    attach_hook(expert.w2)
-                    n_experts_hooked += 1
+            if hasattr(block, 'block_sparse_moe'):
+                attach_hook(block.block_sparse_moe)
+                n_blocks_hooked += 1
 
-        print("✓ Hooks applied: embed + {} expert w2 modules (layers {}-{}).".format(
-            n_experts_hooked, lo, hi - 1))
+        print("✓ Hooks applied: embed + {} MoE modules (layers {}-{}).".format(
+            n_blocks_hooked, lo, hi - 1))
 
     def clear_ablation(self):
         """Clear all ablation directions from hooks, resetting model to original state."""
         def clear_dirs(module):
             if hasattr(module, 'ablation_dirs'):
-                module.ablation_dirs.clear()
+                if hasattr(module, '_ablation_hook_handle'):
+                    module._ablation_hook_handle.remove()
+                    del module._ablation_hook_handle
+                del module.ablation_dirs
 
         clear_dirs(self.model.model.embed_tokens)
         for block in self.model.model.layers:
-            clear_dirs(block.self_attn.o_proj)
-            if hasattr(block, 'block_sparse_moe') and hasattr(block.block_sparse_moe, 'experts'):
-                for expert in block.block_sparse_moe.experts:
-                    clear_dirs(expert.w2)
+            if hasattr(block, 'block_sparse_moe'):
+                clear_dirs(block.block_sparse_moe)
         print("✓ Ablation hooks cleared.")

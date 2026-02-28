@@ -5,7 +5,7 @@ import argparse
 from models.load_models import load_model
 from dataset.load_dataset import load_dataset, load_dataset_split
 from dataset.utils import compute_centroid
-from .ablation_utils import ablate_weights
+from .ablation_utils import ablate_weights, clear_ablation
 import random
 from config import Config
 import os
@@ -180,8 +180,11 @@ def main():
     for layer in range(layers):
 
         single_dir = compute_single_direction(HF, HL, layer)
-        # Ablate model with sd
-        ablate_weights(model, single_dir)
+        # Clear stale hooks before applying the new direction, otherwise
+        # ablation_dirs accumulate across iterations (load_state_dict doesn't
+        # remove registered forward hooks).
+        clear_ablation(model)
+        ablate_weights(model, single_dir, source_layer=layer)
         score = get_refusal_scores(model, hf_val).mean().item()
         intervention_logits = get_last_position_logits(model=model, dataset=hl_val)
         kl_div_score = kl_div_fn(baseline_harmless_logits, intervention_logits).mean(dim=0).item()

@@ -16,6 +16,7 @@ if __name__ == "__main__":
     parser.add_argument("--dir_ids", nargs='+', type=int, default=None)
     parser.add_argument("--dataset_name", type=str, default="harmbench_test", help="Name of dataset to run on.")
     parser.add_argument('--device', default="cuda:0", type=str)
+    parser.add_argument('--layer', type=int, default=31, help="Layer where directions were extracted (centers the hook window for MoE models)")
     args = parser.parse_args()
  
     t_pipeline = time.time()
@@ -42,7 +43,7 @@ if __name__ == "__main__":
     for idx, sing_dir in enumerate(multi_dirs):
         dir_label = str(args.dir_ids[idx]) if args.dir_ids else str(idx)
         aux_name += '_' + dir_label
-        ablate_weights(model, sing_dir)
+        ablate_weights(model, sing_dir, source_layer=args.layer)
     print(f"  Ablation done in {time.time() - t0:.1f}s")
 
     # completions name

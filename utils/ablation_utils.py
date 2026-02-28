@@ -1,5 +1,6 @@
+import inspect
 import os
-import torch 
+import torch
 
 def get_ablated_matrix(matrix: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     # Save the original dtype because FP8 (float8_e4m3fn) math is highly restricted and imprecise
@@ -21,8 +22,12 @@ def get_ablated_matrix(matrix: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     # Cast back to the original format (e.g. float8_e4m3fn)
     return ablated_matrix.to(original_dtype)
 
-def ablate_weights(model, direction: torch.Tensor):
-    model.ablate_weights(direction)
+def ablate_weights(model, direction: torch.Tensor, **kwargs):
+    # Only forward kwargs the model's method actually accepts (e.g. source_layer,
+    # layer_window exist on MiniMax_M25 but not on dense model subclasses).
+    sig = inspect.signature(model.ablate_weights)
+    valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    model.ablate_weights(direction, **valid_kwargs)
 
 def clear_ablation(model):
     """Reset model to pre-ablation state (clear hooks or restore weights)."""
