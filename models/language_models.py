@@ -135,7 +135,11 @@ class LanguageModel(ABC):
         return logits, target_ids
 
     def generate_hookfree_completions(self, dataset, batch_size=16, max_new_tokens=64):
-        generation_config = GenerationConfig(max_new_tokens=max_new_tokens, do_sample=False)
+        generation_config = GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
 
         completions = []
         instructions = [x['instruction'] for x in dataset]
@@ -161,10 +165,18 @@ class LanguageModel(ABC):
             self._current_attention_mask = tokenized_instructions.attention_mask  # keep on CPU
             self._padding_mask_cache = {}  # {device: is_padding tensor}
 
+            # Compute position_ids from attention_mask so left-padded sequences
+            # get correct positional encodings (RoPE). Without this, padding
+            # tokens get sequential positions that shift the real content.
+            attn_mask = self._current_attention_mask
+            position_ids = attn_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attn_mask == 0, 1)
+
             try:
                 generation_toks = self.model.generate(
                     input_ids=tokenized_instructions.input_ids.to(self.model.device),
-                    attention_mask=self._current_attention_mask.to(self.model.device),
+                    attention_mask=attn_mask.to(self.model.device),
+                    position_ids=position_ids.to(self.model.device),
                     generation_config=generation_config,
                 )
             finally:
@@ -699,6 +711,10 @@ class MiniMax_M25(LanguageModel):
                     # Fallback: add a dedicated pad token
                     self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
                 self.tokenizer.padding_side = "left"
+
+            # Propagate pad_token_id to model config so generate() doesn't
+            # fall back to eos_token_id for padding.
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
             # Display device map info
             if hasattr(self.model, 'hf_device_map'):
