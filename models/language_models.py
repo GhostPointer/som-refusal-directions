@@ -165,10 +165,19 @@ class LanguageModel(ABC):
             self._current_attention_mask = tokenized_instructions.attention_mask  # keep on CPU
             self._padding_mask_cache = {}  # {device: is_padding tensor}
 
+            # Compute position_ids from attention_mask so left-padded sequences
+            # get correct RoPE positional encodings. We must pass these explicitly
+            # because GenerationMixin may compute them from cache_position (1D),
+            # which doesn't account for per-sequence padding offsets.
+            attn_mask = self._current_attention_mask
+            position_ids = attn_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attn_mask == 0, 1)
+
             try:
                 generation_toks = self.model.generate(
                     input_ids=tokenized_instructions.input_ids.to(self.model.device),
-                    attention_mask=self._current_attention_mask.to(self.model.device),
+                    attention_mask=attn_mask.to(self.model.device),
+                    position_ids=position_ids.to(self.model.device),
                     generation_config=generation_config,
                 )
             finally:
