@@ -689,10 +689,16 @@ class MiniMax_M25(LanguageModel):
             # Update self.device to match the model's root device (usually cuda:0)
             self.device = self.model.device
 
+            # CRITICAL: Do NOT use eos_token as pad_token — left-padding with
+            # EOS causes model.generate() to stop immediately (empty outputs).
+            # Use unk_token (id 0 in Llama/Mixtral tokenizers) instead.
             if self.tokenizer.pad_token is None:
-                if self.tokenizer.eos_token is not None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                    self.tokenizer.padding_side = "left"
+                if self.tokenizer.unk_token is not None:
+                    self.tokenizer.pad_token = self.tokenizer.unk_token
+                else:
+                    # Fallback: add a dedicated pad token
+                    self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                self.tokenizer.padding_side = "left"
 
             # Display device map info
             if hasattr(self.model, 'hf_device_map'):
